@@ -117,3 +117,123 @@ ORDER BY c.CAT_ID;
 ## Source data
 
 The `acdsee_source/Default/` directory contains a working copy of the ACDSee database from the source PC. It is not modified by the export script.
+
+---
+
+# Asset Path Remapping
+
+Remap orphaned asset paths when images have moved to a new location.
+
+When using ACDSee with external storage (NAS, USB drives, or migrated
+volumes), the database records reference the original paths.  If a drive
+letter changes, a volume is renamed, or images are moved to a new
+filesystem, ACDSee loses the connection to those files.  `remap_assets.py`
+finds the current locations of orphaned assets and updates the database
+in place so that ACDSee sees them again.
+
+## Resolution Levels
+
+| Level | Strategy | Example |
+|-------|----------|---------|
+| **1** — Path prefix remap | Volume/drive letter changed or folder renamed.  The filename and relative path are unchanged. | `D:\Photos\2023\img.jpg` → `/nas/photos/Photos/2023/img.jpg` |
+| **2** — File match by name + metadata | File moved elsewhere; confirmed by matching file size, dimensions, EXIF datetime, and camera make/model. | Same filename found in a different folder, verified via EXIF. |
+| **3** — Metadata-only EXIF signature | File was renamed and/or modified (cropped, edited).  Matched on DateTimeOriginal + camera make/model. | Finds the same photo even if the filename and size differ. |
+
+## Prerequisites
+
+```
+python3 -m venv .venv
+source .venv/bin/activate
+pip install -r requirements.txt
+```
+
+## Usage
+
+```
+python remap_assets.py <db_dir> <image_root> [options]
+```
+
+**Always run with `--dry-run` first** to preview changes before writing:
+
+```
+python remap_assets.py acdsee_source/Default /mnt/nas/photos --dry-run --level 1
+```
+
+### Options
+
+| Option | Default | Description |
+|--------|---------|-------------|
+| `--level {1,2,3}` | `1` | Maximum resolution level |
+| `--dry-run` | off | Report only; do not modify the database |
+| `--no-backup` | off | Skip creating a database backup before writing |
+| `--workers N` | `4` | Number of parallel workers for filesystem scanning |
+| `--log-file PATH` | auto | Custom log file path |
+| `--verbose` | off | Detailed diagnostic output |
+| `--gui` | off | Launch tkinter GUI instead of CLI |
+
+### Examples
+
+```bash
+# Preview what would change (safe, recommended first step)
+python remap_assets.py acdsee_source/Default /mnt/nas/photos --level 2 --dry-run
+
+# Apply changes with backup
+python remap_assets.py acdsee_source/Default /mnt/nas/photos --level 2
+
+# Skip backup (use with caution)
+python remap_assets.py acdsee_source/Default /mnt/nas/photos --level 1 --no-backup
+```
+
+## How It Works
+
+### Volume Identification
+
+ACDSee identifies volumes by their Windows Volume Serial Number (stored
+as `DISC_ID` in the `FolderRoot` table).  The database links asset
+information to `volume_serial + path + filename`.  The remap tool uses
+path and filename matching rather than serial number lookup, which makes
+it robust across filesystem migrations.
+
+### Filesystem Scanning
+
+When `--level 2` or higher is used, the tool walks the entire image root
+to build an index of filenames.  Directories named `@eaDir`, `#recycle`,
+`.DS_Store`, `System Volume Information` and similar are automatically
+skipped.
+
+Network storage (NAS over OpenVPN/SMB) is supported with automatic retry
+on transient I/O errors (EIO, ESTALE, ENETRESET).
+
+### Database Updates
+
+For Level 1 matches, the tool updates `FolderRoot.NAME` and propagates
+prefix mappings through the cache so that all assets under the same
+prefix are quickly resolved.  New folder records are created in the
+`Folder` table hierarchy when needed.
+
+For Level 2/3 matches, `Asset.FOLDER_ID` is updated (and `Asset.NAME` if
+renamed).  After writing, `.cdx` index files are deleted; ACDSee rebuilds
+them on next launch.
+
+### Output Files
+
+Two files are produced per run:
+
+- `remap_YYYYMMDD_HHMMSS.log` — detailed resolution log with per-file info
+- `remap_mappings_YYYYMMDD_HHMMSS.json` — discovered prefix mappings and resolved paths (for audit)
+
+## Testing
+
+```bash
+python -m unittest test_remap_assets -v
+```
+
+Fast unit tests cover path mapping, directory filtering, signature
+matching, and filesystem operations.  Database-loading integration tests
+require the `acdsee_source/` directory and take longer to run.
+
+## Running tests
+
+```bash
+python -m unittest test_remap_assets -v
+```

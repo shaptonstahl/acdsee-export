@@ -1,3 +1,6 @@
 acdsee_source/*
 *.sqlite
 .venv/*
+remap_*.log
+remap_mappings_*.json
+__pycache__/
