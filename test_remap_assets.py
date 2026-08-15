@@ -30,6 +30,9 @@ from remap_assets import (
     FileFinder,
     Remapper,
     backup_database,
+    volume_splits,
+    ManifestIndex,
+    _suffix_split,
 )
 
 # =============================================================================
@@ -470,6 +473,227 @@ class TestNetworkResilience(unittest.TestCase):
 # =============================================================================
 # Requirements checks
 # =============================================================================
+
+class TestVolumeSplits(unittest.TestCase):
+    def test_drive_letter(self):
+        self.assertEqual(volume_splits("E:/Photos/a.jpg"),
+                         [("E:", "Photos/a.jpg")])
+
+    def test_unc_offers_share_then_server(self):
+        # The database stores only the server as the root, with the share as
+        # the first folder, so both boundaries must be tried -- share first.
+        self.assertEqual(
+            volume_splits(r"\\Miracle/photo/0ur camera/x.jpg"),
+            [("//Miracle/photo", "0ur camera/x.jpg"),
+             ("//Miracle", "photo/0ur camera/x.jpg")])
+
+    def test_bare_device_root(self):
+        self.assertEqual(volume_splits("Pixel 3/DCIM/x.jpg"),
+                         [("Pixel 3", "DCIM/x.jpg")])
+
+    def test_nothing_below_volume(self):
+        for path in ("E:", "E:/", "", r"\\Miracle"):
+            self.assertEqual(volume_splits(path), [], path)
+
+    def test_backslash_separators_normalised(self):
+        self.assertEqual(volume_splits(r"D:\Photos\a.jpg"),
+                         [("D:", "Photos/a.jpg")])
+
+
+class TestSuffixSplit(unittest.TestCase):
+    ROOT = "/mnt/photo"
+
+    def test_detects_inserted_directory(self):
+        got = _suffix_split(
+            "E:/Photos/photos/0ur camera/2014/x.jpg",
+            "/mnt/photo/0ur camera/prior to current year/2014/x.jpg",
+            self.ROOT)
+        self.assertEqual(
+            got, ("E:/Photos/photos/0ur camera",
+                  "0ur camera/prior to current year"))
+
+    def test_dropped_prefix_maps_to_root(self):
+        got = _suffix_split("D:/Photos/photos/Kids/x.jpg",
+                            "/mnt/photo/Kids/x.jpg", self.ROOT)
+        self.assertEqual(got, ("D:/Photos/photos", ""))
+
+    def test_case_insensitive_tail(self):
+        got = _suffix_split("E:/Photos/KIDS/X.JPG",
+                            "/mnt/photo/kids/x.jpg", self.ROOT)
+        self.assertEqual(got, ("E:/Photos", ""))
+
+
+class TestManifestIndex(unittest.TestCase):
+    """The manifest layer, exercised without any real storage."""
+
+    RECORDS = [
+        {"SourceFile": "/volume1/photo/Kids/a.jpg", "FileSize": 100,
+         "Make": "Canon", "DateTimeOriginal": "2010:01:01 00:00:00"},
+        {"SourceFile": "/volume1/photo/Trip/a.jpg", "FileSize": 100},
+        {"SourceFile": "/volume1/photo/Kids/b.jpg", "FileSize": 200},
+        # Synology sidecar thumbnails must never become match candidates
+        {"SourceFile": "/volume1/photo/Kids/@eaDir/a.jpg/SYNO_THUMB.jpg",
+         "FileSize": 100},
+        # exiftool scanning its own output mid-write
+        {"SourceFile": "/volume1/photo/m.json", "FileSize": 100},
+        # ...but an unrelated .json asset must survive
+        {"SourceFile": "/volume1/photo/Kids/notes.json", "FileSize": 300},
+    ]
+
+    def setUp(self):
+        self.tmp = tempfile.mkdtemp(prefix="manifest_test_")
+        self.path = os.path.join(self.tmp, "m.json")
+        with open(self.path, "w") as fh:
+            json.dump(self.RECORDS, fh)
+        self.idx = ManifestIndex(self.path, "/mnt/photo")
+        self.idx.load()
+
+    def tearDown(self):
+        shutil.rmtree(self.tmp, ignore_errors=True)
+
+    def test_filters_sidecars_and_self(self):
+        self.assertEqual(len(self.idx.meta), 4)
+        for local in self.idx.meta:
+            self.assertNotIn("@eaDir", local)
+        self.assertFalse(self.idx.has_local("/mnt/photo/m.json"))
+
+    def test_unrelated_json_asset_survives(self):
+        self.assertTrue(self.idx.has_local("/mnt/photo/Kids/notes.json"))
+
+    def test_infers_manifest_root(self):
+        self.assertEqual(self.idx.manifest_root, "/volume1/photo")
+
+    def test_translates_to_image_root(self):
+        self.assertTrue(self.idx.has_local("/mnt/photo/Kids/b.jpg"))
+        self.assertFalse(self.idx.has_local("/volume1/photo/Kids/b.jpg"))
+
+    def test_unique_match(self):
+        self.assertEqual(self.idx.candidates("b.jpg", 200),
+                         ["/mnt/photo/Kids/b.jpg"])
+
+    def test_duplicate_yields_both_candidates(self):
+        self.assertEqual(sorted(self.idx.candidates("a.jpg", 100)),
+                         ["/mnt/photo/Kids/a.jpg", "/mnt/photo/Trip/a.jpg"])
+
+    def test_size_must_match(self):
+        self.assertEqual(self.idx.candidates("b.jpg", 999), [])
+
+    def test_name_match_is_case_insensitive(self):
+        self.assertEqual(self.idx.candidates("B.JPG", 200),
+                         ["/mnt/photo/Kids/b.jpg"])
+
+    def test_explicit_manifest_root_overrides(self):
+        idx = ManifestIndex(self.path, "/mnt/x", manifest_root="/volume1")
+        idx.load()
+        self.assertTrue(idx.has_local("/mnt/x/photo/Kids/b.jpg"))
+
+
+class TestManifestRules(BaseTest):
+    """Rule learning and tie-breaking, driven through a real Remapper."""
+
+    def _remapper(self, records):
+        tmp = self.mktemp()
+        mpath = os.path.join(tmp, "m.json")
+        with open(mpath, "w") as fh:
+            json.dump(records, fh)
+        idx = ManifestIndex(mpath, tmp)
+        idx.load()
+        r = Remapper(AcdDatabase(self.DB_DIR), self.DB_DIR, tmp,
+                     dry_run=True, log_dir=tmp, manifest=idx)
+        return r, tmp
+
+    def test_learns_rule_and_breaks_tie(self):
+        # Two confident matches establish E:/Photos/photos -> Kids.
+        # A third asset's name+size is ambiguous; the rule must pick the
+        # copy that sits where the established rule predicts.
+        recs = [
+            {"SourceFile": "/v/Kids/one.jpg", "FileSize": 11},
+            {"SourceFile": "/v/Kids/two.jpg", "FileSize": 22},
+            {"SourceFile": "/v/Kids/three.jpg", "FileSize": 33},
+            {"SourceFile": "/v/Other/three.jpg", "FileSize": 33},
+        ]
+        r, tmp = self._remapper(recs)
+        orphans = []
+        for name, size in (("one.jpg", 11), ("two.jpg", 22), ("three.jpg", 33)):
+            meta = {"name": name, "size": size,
+                    "original_path": f"E:/Photos/photos/{name}"}
+            orphans.append(({}, meta))
+        r._resolve_manifest(orphans)
+
+        picked = {m["name"]: m.get("new_path") for _a, m in orphans}
+        self.assertEqual(picked["one.jpg"], os.path.join(tmp, "Kids", "one.jpg"))
+        self.assertEqual(picked["three.jpg"],
+                         os.path.join(tmp, "Kids", "three.jpg"))
+        self.assertEqual(orphans[2][1]["resolution_type"], "manifest_rule")
+        self.assertEqual(r.stats["level1"], 2)
+        self.assertEqual(r.stats["level2"], 1)
+
+    def test_exact_position_beats_rule(self):
+        # Two copies of the same photo.  One sits exactly where the database
+        # says (below its volume); a learned rule points at the other.  The
+        # positional match must win -- it is the asset's own file.
+        recs = [
+            {"SourceFile": "/v/Kids/a.jpg", "FileSize": 10},
+            {"SourceFile": "/v/Kids/b.jpg", "FileSize": 20},
+            {"SourceFile": "/v/Kids/dup.jpg", "FileSize": 30},
+            {"SourceFile": "/v/Photos/photos/dup.jpg", "FileSize": 30},
+        ]
+        r, tmp = self._remapper(recs)
+        orphans = [({}, {"name": n, "size": s,
+                         "original_path": f"E:/Photos/photos/{n}"})
+                   for n, s in (("a.jpg", 10), ("b.jpg", 20))]
+        target = {"name": "dup.jpg", "size": 30,
+                  "original_path": "E:/Photos/photos/dup.jpg"}
+        orphans.append(({}, target))
+        r._resolve_manifest(orphans)
+        self.assertEqual(target["new_path"],
+                         os.path.join(tmp, "Photos", "photos", "dup.jpg"))
+        self.assertEqual(target["resolution_type"], "manifest_position")
+
+    def test_position_ignored_when_two_candidates_share_the_tail(self):
+        # Same relative path under two migrated volumes: genuinely ambiguous,
+        # so the positional shortcut must decline rather than pick one.
+        recs = [
+            {"SourceFile": "/v/E/Photos/x.jpg", "FileSize": 5},
+            {"SourceFile": "/v/D/Photos/x.jpg", "FileSize": 5},
+        ]
+        r, _tmp = self._remapper(recs)
+        meta = {"name": "x.jpg", "size": 5,
+                "original_path": "E:/Photos/x.jpg"}
+        orphans = [({}, meta)]
+        r._resolve_manifest(orphans)
+        self.assertIsNone(meta.get("resolution_level"))
+
+    def test_unsupported_tie_left_unresolved(self):
+        # With no rule to prefer either copy, the asset must be left alone
+        # rather than guessed at.
+        recs = [
+            {"SourceFile": "/v/A/dup.jpg", "FileSize": 50},
+            {"SourceFile": "/v/B/dup.jpg", "FileSize": 50},
+        ]
+        r, _tmp = self._remapper(recs)
+        meta = {"name": "dup.jpg", "size": 50,
+                "original_path": "Z:/somewhere/dup.jpg"}
+        orphans = [({}, meta)]
+        r._resolve_manifest(orphans)
+        self.assertIsNone(meta.get("resolution_level"))
+        self.assertEqual(r.stats["level1"] + r.stats["level2"], 0)
+
+    def test_absent_asset_is_not_resolved(self):
+        r, _tmp = self._remapper([{"SourceFile": "/v/A/x.jpg", "FileSize": 1}])
+        meta = {"name": "missing.jpg", "size": 999,
+                "original_path": "E:/gone/missing.jpg"}
+        orphans = [({}, meta)]
+        r._resolve_manifest(orphans)
+        self.assertIsNone(meta.get("resolution_level"))
+
+    def test_size_mismatch_is_not_resolved(self):
+        r, _tmp = self._remapper([{"SourceFile": "/v/A/x.jpg", "FileSize": 1}])
+        meta = {"name": "x.jpg", "size": 2, "original_path": "E:/a/x.jpg"}
+        orphans = [({}, meta)]
+        r._resolve_manifest(orphans)
+        self.assertIsNone(meta.get("resolution_level"))
+
 
 class TestRequirements(unittest.TestCase):
     def test_dbfread_available(self):

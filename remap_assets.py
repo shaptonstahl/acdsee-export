@@ -71,8 +71,54 @@ def normalize_path(path: str) -> str:
 
 
 def normalize_for_compare(text: str) -> str:
-    """Unicode NFC normalise + lowercase for case‑insensitive comparison."""
-    return unicodedata.normalize("NFC", text).casefold()
+    """Unicode NFC normalise + lowercase for case‑insensitive comparison.
+
+    Real camera EXIF is frequently NUL-padded to a fixed field width -- a
+    Make of ``'HTC'`` arrives as ``'HTC'`` followed by 90 NUL bytes.  Those
+    are stripped here so equality comparisons behave the way callers expect.
+    """
+    return unicodedata.normalize("NFC", text).replace("\x00", "").strip().casefold()
+
+
+def volume_splits(path: str) -> list[tuple[str, str]]:
+    """Candidate (volume_prefix, remainder) splits for a database path.
+
+    Level 1 works by swapping a volume prefix for a new location, so it needs
+    to know where the volume ends and the relative path begins.
+
+    A drive letter yields exactly one split.  A UNC path yields two: the
+    database records only the server as the FolderRoot (``\\\\Miracle``) and
+    stores the share (``photo``) as the first folder, so the mount point may
+    correspond to either ``\\\\server`` or ``\\\\server/share``.  The
+    share-level split is offered first because mounting a single share is the
+    common case.  Anything else (e.g. the 'Pixel 3' MTP root) is split after
+    its first component.
+
+    Returns [] when there is nothing below the volume to match on.
+    """
+    p = normalize_path(path)
+    if not p:
+        return []
+    head = p.split("/")[0]
+
+    if ":" in head:                      # C:/..., E:/...
+        prefix, rest = p.split(":", 1)
+        rest = rest.lstrip("/")
+        return [(f"{prefix}:", rest)] if rest else []
+
+    parts = [seg for seg in p.split("/") if seg]
+    if not parts:
+        return []
+
+    if p.startswith("//"):               # \\server/share/...
+        splits = []
+        if len(parts) > 2:
+            splits.append(("//" + "/".join(parts[:2]), "/".join(parts[2:])))
+        if len(parts) > 1:
+            splits.append(("//" + parts[0], "/".join(parts[1:])))
+        return splits
+
+    return [(parts[0], "/".join(parts[1:]))] if len(parts) > 1 else []
 
 # ---------------------------------------------------------------------------
 # Network filesystem resilience
@@ -681,27 +727,40 @@ def _signature_match_score(db_sig: dict, img_sig: dict) -> int:
 # ---------------------------------------------------------------------------
 
 class FileFinder:
-    """Locates files under an image root."""
+    """Locates files under an image root.
 
-    def __init__(self, image_root: str):
+    When a manifest is attached, every existence check is answered from it
+    instead of the filesystem.  Over SMB that is the difference between a
+    network round-trip and a set lookup, and the manifest already enumerates
+    the whole storage, so nothing is lost.
+    """
+
+    def __init__(self, image_root: str, manifest: Optional["ManifestIndex"] = None):
         self.root = os.path.abspath(image_root)
+        self.manifest = manifest
         self._stem_index: dict[str, list[str]] = {}  # stem -> [full_path, ...]
         self._indexed = False
 
     def exists(self, path: str) -> bool:
+        if self.manifest:
+            return self.manifest.has_local(path)
         return safe_isfile(path)
 
     def build_index(self, workers: int = 4) -> None:
         if self._indexed:
             return
         log = logging.getLogger("remap")
-        log.info("Indexing files under %s ...", self.root)
 
         all_files: list[str] = []
-        for dirpath, dirnames, filenames in _safe_walk(self.root):
-            dirnames[:] = [d for d in dirnames if not _should_skip_dir(d)]
-            for fn in filenames:
-                all_files.append(os.path.join(dirpath, fn))
+        if self.manifest:
+            log.info("Indexing files from manifest ...")
+            all_files = list(self.manifest.meta)
+        else:
+            log.info("Indexing files under %s ...", self.root)
+            for dirpath, dirnames, filenames in _safe_walk(self.root):
+                dirnames[:] = [d for d in dirnames if not _should_skip_dir(d)]
+                for fn in filenames:
+                    all_files.append(os.path.join(dirpath, fn))
 
         self._stem_index = {}
         batch_size = 5000
@@ -717,7 +776,7 @@ class FileFinder:
     def check_relative(self, rel_path: str) -> Optional[str]:
         """Return full path if *rel_path* exists under self.root, else None."""
         full = os.path.normpath(os.path.join(self.root, rel_path.lstrip("/\\")))
-        return full if safe_isfile(full) else None
+        return full if self.exists(full) else None
 
     def find_by_filename(self, filename: str) -> list[str]:
         stem = normalize_for_compare(os.path.splitext(filename)[0])
@@ -732,6 +791,133 @@ def _index_one(filepath: str) -> tuple[str, str]:
 
 
 # ---------------------------------------------------------------------------
+# ManifestIndex — offline view of the image storage
+# ---------------------------------------------------------------------------
+
+class ManifestIndex:
+    """A filename+size index built from an exiftool JSON manifest.
+
+    Walking a NAS over SMB costs roughly 440 file-names per second, and
+    opening files for EXIF costs about 2.4 per second — a full pass over a
+    165k-asset library takes the better part of a day.  Running exiftool on
+    the storage device itself and shipping back its JSON reduces the same
+    work to a few seconds of local lookups.
+
+    Generate one with, on the NAS:
+
+        exiftool -r -q -j -n -FileSize -DateTimeOriginal -CreateDate \\
+            -Make -Model -LensModel -FocalLength -FNumber \\
+            -ImageWidth -ImageHeight /volume1/photo > exif_manifest.json
+    """
+
+    def __init__(self, manifest_path: str, image_root: str,
+                 manifest_root: Optional[str] = None):
+        self.manifest_path = manifest_path
+        self.image_root = os.path.abspath(image_root)
+        self.manifest_root = manifest_root
+        self.by_name_size: dict[tuple[str, int], list[str]] = {}
+        self.meta: dict[str, dict] = {}
+        self._local_paths: set[str] = set()
+        self.log = logging.getLogger("remap")
+
+    # -- loading ----------------------------------------------------------
+
+    def _is_noise(self, path: str) -> bool:
+        """Reject Synology sidecars, system dirs, and the manifest itself.
+
+        exiftool scans its own output when the manifest is written inside the
+        tree being scanned, producing a record with nonsense EXIF parsed out
+        of the JSON bytes.  Only that exact filename is excluded, so genuine
+        .json assets in the library survive.
+        """
+        parts = path.split("/")
+        if any(_should_skip_dir(seg) for seg in parts[:-1]):
+            return True
+        return parts[-1] == os.path.basename(self.manifest_path)
+
+    def _derive_root(self, sources: list[str]) -> str:
+        """Longest common directory prefix of the manifest's own paths."""
+        if self.manifest_root:
+            return self.manifest_root.rstrip("/")
+        common = os.path.dirname(sources[0])
+        for src in sources:
+            while not src.startswith(common + "/"):
+                parent = os.path.dirname(common)
+                if parent == common:
+                    return common
+                common = parent
+        return common
+
+    def load(self) -> None:
+        self.log.info("Loading manifest %s ...", self.manifest_path)
+        with open(self.manifest_path) as fh:
+            records = json.load(fh)
+
+        kept = [r for r in records
+                if r.get("SourceFile") and not self._is_noise(r["SourceFile"])]
+        dropped = len(records) - len(kept)
+        if not kept:
+            raise ValueError(f"No usable records in {self.manifest_path}")
+
+        explicit = bool(self.manifest_root)
+        root = self._derive_root([r["SourceFile"] for r in kept])
+        self.manifest_root = root
+
+        if not explicit:
+            tops = {r["SourceFile"][len(root):].lstrip("/").split("/")[0]
+                    for r in kept}
+            if len(tops) < 2:
+                self.log.warning(
+                    "Manifest root inferred as %s, but everything sits under a "
+                    "single entry (%s) -- if that entry is a real folder rather "
+                    "than the share itself, pass --manifest-root explicitly.",
+                    root, next(iter(tops), "?"))
+
+        for rec in kept:
+            src = rec["SourceFile"]
+            rel = src[len(root):].lstrip("/")
+            local = os.path.join(self.image_root, rel.replace("/", os.sep))
+            self.meta[local] = rec
+            self._local_paths.add(local)
+            key = (normalize_for_compare(os.path.basename(src)),
+                   int(rec.get("FileSize") or 0))
+            self.by_name_size.setdefault(key, []).append(local)
+
+        self.log.info("Manifest: %d files indexed (%d sidecar/system entries "
+                      "dropped), root %s -> %s",
+                      len(kept), dropped, root, self.image_root)
+
+    # -- lookups ----------------------------------------------------------
+
+    def has_local(self, local_path: str) -> bool:
+        return os.path.normpath(local_path) in self._local_paths
+
+    def candidates(self, filename: str, size: int) -> list[str]:
+        return self.by_name_size.get((normalize_for_compare(filename), size), [])
+
+
+def _suffix_split(db_path: str, local_path: str, image_root: str
+                  ) -> Optional[tuple[str, str]]:
+    """Split a matched pair at their longest common trailing components.
+
+    ``E:/Photos/photos/0ur camera/2014/x.jpg`` matched against
+    ``<root>/0ur camera/prior to current year/2014/x.jpg`` yields
+    ``('E:/Photos/photos/0ur camera', '0ur camera/prior to current year')`` —
+    the reorganisation that took place above the shared tail.
+    """
+    dbp = [s for s in normalize_path(db_path).split("/") if s]
+    rel = os.path.relpath(local_path, image_root).replace(os.sep, "/")
+    nas = [s for s in rel.split("/") if s and s != ".."]
+    if not dbp or not nas:
+        return None
+    i = 0
+    while (i < min(len(dbp), len(nas))
+           and normalize_for_compare(dbp[-1 - i]) == normalize_for_compare(nas[-1 - i])):
+        i += 1
+    return "/".join(dbp[:len(dbp) - i]), "/".join(nas[:len(nas) - i])
+
+
+# ---------------------------------------------------------------------------
 # Remapper — core resolution & write-back
 # ---------------------------------------------------------------------------
 
@@ -741,14 +927,15 @@ class Remapper:
     def __init__(
         self, db: AcdDatabase, db_dir: str, image_root: str,
         level: int = 1, dry_run: bool = True, workers: int = 4,
-        log_dir: str = ".",
+        log_dir: str = ".", manifest: Optional["ManifestIndex"] = None,
     ):
         self.db = db
         self.db_dir = db_dir
         self.level = level
         self.dry_run = dry_run
         self.workers = workers
-        self.finder = FileFinder(image_root)
+        self.manifest = manifest
+        self.finder = FileFinder(image_root, manifest=manifest)
         self.mapper = PathMapper()
         self.log = logging.getLogger("remap")
         self.stats: dict[str, int] = dict(total=0, present=0, orphan=0,
@@ -799,7 +986,11 @@ class Remapper:
             self._finish(t0)
             return
 
-        # Execute resolution levels sequentially
+        # Execute resolution strategies sequentially.  The manifest goes
+        # first: it is the only one that verifies a match (filename AND
+        # size) without touching the network.
+        if self.manifest:
+            self._resolve_manifest(orphans)
         self._resolve_level1(orphans)
         if self.level >= 2:
             self._resolve_level2(orphans)
@@ -809,6 +1000,7 @@ class Remapper:
         unresolved = [(a, m) for a, m in orphans if m.get("resolution_level") is None]
         self.stats["unresolved"] = len(unresolved)
         self._log_summary(unresolved)
+        self._log_contention()
         self._write_mappings()
 
         if not self.dry_run and self.stats["level1"] + self.stats["level2"] + self.stats["level3"] > 0:
@@ -824,12 +1016,19 @@ class Remapper:
                       self.stats["level3"], self.stats["errors"], self.stats["unresolved"])
 
     def _asset_present(self, path: str) -> bool:
+        # With a manifest, answer from the index instead of issuing a stat
+        # per asset across the network.
+        if self.manifest:
+            for _prefix, rest in volume_splits(path):
+                test = os.path.normpath(os.path.join(self.finder.root, rest))
+                if self.manifest.has_local(test):
+                    return True
+            return False
+
         if safe_isfile(path):
             return True
-        # Try stripping the drive letter and testing under image root
-        if ":" in path:
-            _, rest = path.split(":", 1)
-            rest = rest.lstrip("/").lstrip("\\")
+        # Try stripping the volume prefix and testing under image root
+        for _prefix, rest in volume_splits(path):
             test = os.path.normpath(os.path.join(self.finder.root, rest))
             if safe_isfile(test):
                 return True
@@ -843,6 +1042,138 @@ class Remapper:
             if safe_isfile(f):
                 return True
         return False
+
+    # ------------------------------------------------------------------
+    # Manifest resolution — offline filename+size matching
+    # ------------------------------------------------------------------
+
+    def _resolve_manifest(self, orphans: list) -> None:
+        """Resolve orphans against a pre-harvested manifest of the storage.
+
+        Runs in three passes.  The first accepts only assets whose
+        filename+size is unique in the manifest, which is a verified match
+        rather than a guess.  The second learns directory-rewrite rules from
+        those confident matches alone — never from ambiguous ones, which
+        would be circular.  The third uses those rules to break ties among
+        duplicate copies.  Anything still tied is left unresolved for the
+        later levels rather than guessed at.
+        """
+        mf = self.manifest
+        self.log.info("--- Manifest: filename + size matching ---")
+
+        ambiguous: list[tuple[dict, dict, list[str]]] = []
+        for a, meta in orphans:
+            if meta.get("resolution_level"):
+                continue
+            name, size = meta.get("name") or "", meta.get("size") or 0
+            if not name or not size:
+                continue
+            cands = mf.candidates(name, size)
+            if not cands:
+                continue
+            if len(cands) == 1:
+                self._record_manifest(meta, cands[0], 1, "manifest_unique")
+            else:
+                ambiguous.append((a, meta, cands))
+
+        rules = self._learn_rules()
+        self.log.info("Learned %d directory-rewrite rules from %d confident "
+                      "matches; %d assets ambiguous",
+                      len(rules), self.stats["level1"], len(ambiguous))
+
+        tied = 0
+        for a, meta, cands in ambiguous:
+            # An exact positional match beats any learned rule: if one copy
+            # sits exactly where the database says, relative to its volume,
+            # that is the asset's own file and not a duplicate of it.
+            exact = self._exact_position(meta["original_path"], cands)
+            if exact:
+                self._record_manifest(meta, exact, 1, "manifest_position")
+                continue
+
+            best, best_score, ties = None, 0, 0
+            for cand in cands:
+                score = self._rule_score(rules, meta["original_path"], cand)
+                if score > best_score:
+                    best, best_score, ties = cand, score, 1
+                elif score == best_score and score > 0:
+                    ties += 1
+            if best and ties == 1:
+                self._record_manifest(meta, best, 2, "manifest_rule")
+            else:
+                tied += 1
+        if tied:
+            self.log.info("  %d ambiguous assets left unresolved (no rule "
+                          "preferred a single copy)", tied)
+
+    def _exact_position(self, db_path: str, cands: list[str]) -> Optional[str]:
+        """The candidate sitting exactly where the database says, if unique.
+
+        Matches on the whole path below the volume rather than on a fixed
+        location, because the image root may be the migrated volume itself
+        or a directory holding several migrated volumes side by side.  A
+        suffix shared by two candidates is ambiguous and yields nothing, so
+        the rule tie-breaker still gets its turn.
+        """
+        tails = [normalize_for_compare(rest.replace("/", os.sep))
+                 for _prefix, rest in volume_splits(db_path)]
+        if not tails:
+            return None
+        hits = [c for c in cands
+                if any(normalize_for_compare(c).endswith(os.sep + t)
+                       for t in tails)]
+        return hits[0] if len(hits) == 1 else None
+
+    def _record_manifest(self, meta: dict, local_path: str,
+                         level: int, method: str) -> None:
+        meta["new_path"] = local_path
+        meta["resolution_level"] = level
+        meta["resolution_type"] = method
+        self.stats[f"level{level}"] += 1
+        split = _suffix_split(meta["original_path"], local_path, self.finder.root)
+        if split and split[0]:
+            new_prefix = os.path.join(self.finder.root,
+                                      split[1].replace("/", os.sep))
+            self.mapper.add(split[0], new_prefix)
+        self.resolutions.append(dict(meta))
+
+    def _learn_rules(self) -> dict[str, list[tuple[str, int]]]:
+        """Weighted directory-rewrite rules, keyed by database prefix."""
+        counts: dict[str, dict[str, int]] = {}
+        for res in self.resolutions:
+            if res.get("resolution_type") != "manifest_unique":
+                continue
+            split = _suffix_split(res["original_path"], res["new_path"],
+                                  self.finder.root)
+            if not split:
+                continue
+            db_prefix, nas_prefix = split
+            bucket = counts.setdefault(db_prefix, {})
+            bucket[nas_prefix] = bucket.get(nas_prefix, 0) + 1
+        return {k: sorted(v.items(), key=lambda kv: -kv[1])
+                for k, v in counts.items()}
+
+    def _rule_score(self, rules: dict, db_path: str, candidate: str) -> int:
+        """How strongly the learned rules endorse *candidate* for *db_path*.
+
+        Matches the longest database prefix with a known rule, then checks
+        whether the candidate sits where that rule predicts.  Returns the
+        rule's weight, or 0 if no rule endorses it.
+        """
+        parts = [s for s in normalize_path(db_path).split("/") if s][:-1]
+        cand_dir = os.path.dirname(os.path.relpath(candidate, self.finder.root))
+        cand_dir = normalize_for_compare(cand_dir.replace(os.sep, "/").strip("./"))
+        for k in range(len(parts), 0, -1):
+            prefix = "/".join(parts[:k])
+            if prefix not in rules:
+                continue
+            tail = "/".join(parts[k:])
+            for nas_prefix, weight in rules[prefix]:
+                predicted = "/".join(p for p in (nas_prefix, tail) if p)
+                if normalize_for_compare(predicted.strip("/")) == cand_dir:
+                    return weight
+            return 0
+        return 0
 
     # ------------------------------------------------------------------
     # Level 1 — path prefix remapping
@@ -860,7 +1191,7 @@ class Remapper:
                 mapped = self.mapper.resolve(path)
                 if mapped:
                     mp = mapped.replace("/", os.sep)
-                    if safe_isfile(mp):
+                    if self.finder.exists(mp):
                         self._record_l1(meta, mp, "cached_prefix", "", "")
                         continue
                     c = self.finder.check_relative(mapped.lstrip("/\\"))
@@ -882,16 +1213,13 @@ class Remapper:
             self._probe_root_subdirs(still)
 
     def _match_direct(self, meta: dict, path: str) -> bool:
-        """Strip drive letter, see if relative path exists under image_root."""
-        if ":" not in path:
-            return False
-        drive, rest = path.split(":", 1)
-        rest = rest.lstrip("/").lstrip("\\")
-        candidate = self.finder.check_relative(rest)
-        if candidate:
-            self._record_l1(meta, candidate, "direct_match",
-                            f"{drive}:", self.finder.root)
-            return True
+        """Strip the volume prefix, see if the rest exists under image_root."""
+        for prefix, rest in volume_splits(path):
+            candidate = self.finder.check_relative(rest)
+            if candidate:
+                self._record_l1(meta, candidate, "direct_match",
+                                prefix, self.finder.root)
+                return True
         return False
 
     def _probe_root_subdirs(self, unresolved: list) -> None:
@@ -910,18 +1238,18 @@ class Remapper:
 
         for a, meta in unresolved:
             path = meta["original_path"]
-            if not path or ":" not in path:
+            if not path:
                 continue
-            drive, rest = path.split(":", 1)
-            rest = rest.lstrip("/").lstrip("\\")
-            for sd in subdirs:
-                candidate = os.path.normpath(
-                    os.path.join(self.finder.root, sd, rest))
-                if safe_isfile(candidate):
-                    old_prefix = f"{drive}:"
-                    new_prefix = os.path.join(self.finder.root, sd)
-                    self._record_l1(meta, candidate, "probe_root",
-                                    old_prefix, new_prefix)
+            for prefix, rest in volume_splits(path):
+                hit = None
+                for sd in subdirs:
+                    candidate = os.path.normpath(
+                        os.path.join(self.finder.root, sd, rest))
+                    if self.finder.exists(candidate):
+                        hit = (candidate, os.path.join(self.finder.root, sd))
+                        break
+                if hit:
+                    self._record_l1(meta, hit[0], "probe_root", prefix, hit[1])
                     break
 
     def _record_l1(self, meta: dict, new_path: str, method: str,
@@ -958,13 +1286,28 @@ class Remapper:
                     self.log.info("  [L2] %s -> %s", meta["original_path"], candidate)
                     break
 
+    def _file_facts(self, filepath: str) -> tuple[int, dict]:
+        """Return (size, exif) for a candidate, from the manifest if we have one.
+
+        Opening a file for EXIF across SMB costs roughly 400 ms; the manifest
+        already carries the same tags, so this keeps level 2 and 3 offline.
+        """
+        if self.manifest:
+            rec = self.manifest.meta.get(os.path.normpath(filepath))
+            if rec is None:
+                return 0, {}
+            exif = {k: v for k, v in rec.items()
+                    if k != "SourceFile" and v not in (None, "")}
+            return int(rec.get("FileSize") or 0), exif
+        return _img_file_size(filepath), read_exif(filepath)
+
     def _metadata_ok(self, meta: dict, filepath: str) -> bool:
         """Verify file size + key EXIF fields match the database record."""
+        size, exif = self._file_facts(filepath)
         # File size
         if meta.get("size"):
-            if _img_file_size(filepath) != meta["size"]:
+            if size != meta["size"]:
                 return False
-        exif = read_exif(filepath)
         if not exif:
             return meta.get("size") is not None  # accept on size alone if no EXIF
 
@@ -978,14 +1321,14 @@ class Remapper:
 
         # EXIF DateTimeOriginal
         db_dt = str(meta.get("date_time_original") or "").replace(":", "-")[:10]  # date only
-        ex_dt = exif.get("DateTimeOriginal", "").replace(":", "-")[:10]
+        ex_dt = str(exif.get("DateTimeOriginal") or "").replace(":", "-")[:10]
         if db_dt and ex_dt and db_dt != ex_dt:
             return False
 
         # Camera make / model
         for key, exif_key in [("camera_make", "Make"), ("camera_model", "Model")]:
             db_v = normalize_for_compare(str(meta.get(key) or ""))
-            ex_v = normalize_for_compare(exif.get(exif_key, ""))
+            ex_v = normalize_for_compare(str(exif.get(exif_key) or ""))
             if db_v and ex_v and db_v not in ex_v and ex_v not in db_v:
                 return False
         return True
@@ -996,38 +1339,55 @@ class Remapper:
 
     def _resolve_level3(self, orphans: list) -> None:
         self.log.info("--- Level 3: EXIF signature matching ---")
-        self.log.info("Scanning images for EXIF (this may take a while)...")
 
         remaining = [(a, m) for a, m in orphans if not m.get("resolution_level")]
         if not remaining:
             return
 
-        # Build EXIF index for every image under root
+        # Build an EXIF index for every image under root.  From a manifest
+        # this is instant; otherwise every file must be opened, which across
+        # a network share runs at a few files per second.
         image_exif: dict[str, dict] = {}
-        all_imgs = _collect_images(self.finder.root)
-        batch = 500
-        for i in range(0, len(all_imgs), batch):
-            chunk = all_imgs[i:i + batch]
-            with concurrent.futures.ThreadPoolExecutor(max_workers=min(self.workers, 8)) as ex:
-                fut = {ex.submit(read_exif, p): p for p in chunk}
-                for f in concurrent.futures.as_completed(fut):
-                    p = fut[f]
-                    try:
-                        e = f.result()
-                        if e:
-                            image_exif[p] = e
-                    except Exception:
-                        pass
+        if self.manifest:
+            self.log.info("Reading EXIF from manifest...")
+            for local, rec in self.manifest.meta.items():
+                e = {k: v for k, v in rec.items()
+                     if k != "SourceFile" and v not in (None, "")}
+                if e:
+                    image_exif[local] = e
+            all_imgs = list(self.manifest.meta)
+        else:
+            self.log.info("Scanning images for EXIF (this may take a while)...")
+            all_imgs = _collect_images(self.finder.root)
+            batch = 500
+            for i in range(0, len(all_imgs), batch):
+                chunk = all_imgs[i:i + batch]
+                with concurrent.futures.ThreadPoolExecutor(max_workers=min(self.workers, 8)) as ex:
+                    fut = {ex.submit(read_exif, p): p for p in chunk}
+                    for f in concurrent.futures.as_completed(fut):
+                        p = fut[f]
+                        try:
+                            e = f.result()
+                            if e:
+                                image_exif[p] = e
+                        except Exception:
+                            pass
 
         self.log.info("Scanned %d images, %d with EXIF data", len(all_imgs), len(image_exif))
+
+        # Signatures are derived once per image, not once per comparison: the
+        # loop below is |unresolved| x |images|, so rebuilding them inline
+        # costs hundreds of millions of redundant dict constructions.
+        img_sigs = [(p, _build_signature(e)) for p, e in image_exif.items()]
+        img_sigs = [(p, s) for p, s in img_sigs if s]
 
         for a, meta in remaining:
             db_sig = _build_signature(meta)
             if not db_sig:
                 continue
             best, best_score = None, 0
-            for img_path, exif in image_exif.items():
-                score = _signature_match_score(db_sig, _build_signature(exif))
+            for img_path, img_sig in img_sigs:
+                score = _signature_match_score(db_sig, img_sig)
                 if score > best_score:
                     best_score, best = score, img_path
             if best and best_score >= 2:
@@ -1210,17 +1570,43 @@ class Remapper:
             if len(unresolved) > 50:
                 self.log.info("  ... and %d more", len(unresolved) - 50)
 
+    def _log_contention(self) -> None:
+        """Report target files claimed by more than one asset.
+
+        The database catalogued the same photo from several drives while the
+        migrated storage keeps a single copy, so a many-to-one outcome is
+        expected rather than wrong -- but it means those assets will end up
+        as multiple records pointing at one file, which is worth seeing
+        before any writes happen.
+        """
+        counts: dict[str, int] = {}
+        for res in self.resolutions:
+            p = res.get("new_path")
+            if p:
+                counts[p] = counts.get(p, 0) + 1
+        shared = {p: n for p, n in counts.items() if n > 1}
+        if not shared:
+            return
+        self.log.info("%d target files are claimed by more than one asset "
+                      "(%d resolutions, max %d on one file) — duplicate "
+                      "catalogue entries collapsing onto one surviving copy",
+                      len(shared), sum(shared.values()), max(shared.values()))
+
     def _write_mappings(self) -> None:
         out = {
             "image_root": self.finder.root,
             "timestamp": datetime.datetime.now().isoformat(),
             "stats": self.stats,
             "prefix_mappings": self.mapper.all_mappings(),
-            "resolutions": self.resolutions[:2000],
+            # Every resolution is written: this file is the audit trail for
+            # the changes _apply_updates makes, so truncating it would leave
+            # most of the database edits unrecorded.
+            "resolutions": self.resolutions,
         }
         with open(self.map_path, "w") as f:
             json.dump(out, f, indent=2, default=str)
-        self.log.info("Mappings → %s", self.map_path)
+        self.log.info("Mappings → %s (%d resolutions)",
+                      self.map_path, len(self.resolutions))
 
 
 def _collect_images(root: str) -> list[str]:
@@ -1276,7 +1662,10 @@ def main() -> None:
         epilog="Resolution levels:\n"
                "  1  Path prefix remapping (volume/drive or folder renamed)\n"
                "  2  Individual file match by name + metadata (EXIF)\n"
-               "  3  Metadata-only EXIF signature match (renamed/modified images)\n")
+               "  3  Metadata-only EXIF signature match (renamed/modified images)\n"
+               "\n"
+               "With --manifest, an offline filename+size pass runs first and\n"
+               "resolves most assets without touching the network.\n")
     p.add_argument("db_dir", nargs="?", help="ACDSee database directory (.dbf/.fpt/.cdx)")
     p.add_argument("image_root", nargs="?", help="Root of current image storage")
     p.add_argument("--level", type=int, choices=[1, 2, 3], default=1,
@@ -1285,6 +1674,12 @@ def main() -> None:
     p.add_argument("--no-backup", action="store_true", help="Skip backup")
     p.add_argument("--log-file", help="Custom log path")
     p.add_argument("--workers", type=int, default=4, help="Parallel workers (4)")
+    p.add_argument("--manifest",
+                   help="exiftool JSON manifest of the image storage; enables "
+                        "offline filename+size resolution")
+    p.add_argument("--manifest-root",
+                   help="Path prefix inside the manifest that corresponds to "
+                        "image_root (default: inferred)")
     p.add_argument("--verbose", action="store_true")
     p.add_argument("--gui", action="store_true", help="Launch tkinter GUI")
     args = p.parse_args()
@@ -1306,13 +1701,22 @@ def main() -> None:
     setup_logging(log_path, args.verbose)
     log = logging.getLogger("remap")
 
+    manifest = None
+    if args.manifest:
+        if not os.path.isfile(args.manifest):
+            print(f"Error: no such manifest: {args.manifest}"); sys.exit(1)
+        manifest = ManifestIndex(args.manifest, args.image_root,
+                                 args.manifest_root)
+        manifest.load()
+
     if not args.dry_run and not args.no_backup:
         backup_database(args.db_dir)
 
     db = AcdDatabase(args.db_dir)
     r = Remapper(db, args.db_dir, args.image_root,
                  level=args.level, dry_run=args.dry_run,
-                 workers=args.workers, log_dir=os.getcwd())
+                 workers=args.workers, log_dir=os.getcwd(),
+                 manifest=manifest)
     r.run()
 
     if args.dry_run:
