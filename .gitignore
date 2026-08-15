@@ -4,3 +4,7 @@ acdsee_source/*
 remap_*.log
 remap_mappings_*.json
 __pycache__/
+# exiftool manifests: ~111 MB for a 165k-asset library, and regenerable
+exif_manifest.json
+*_exif_manifest.json
+fixture_manifest.json
