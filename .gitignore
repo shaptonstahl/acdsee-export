@@ -4,3 +4,6 @@ acdsee_source/*
 remap_*.log
 remap_mappings_*.json
 __pycache__/
+
+# CodeGraph index (local code-intelligence, not source)
+.codegraph/
