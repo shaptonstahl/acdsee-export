@@ -7,3 +7,5 @@ __pycache__/
 
 # CodeGraph index (local code-intelligence, not source)
 .codegraph/
+
+exif_manifest.json
